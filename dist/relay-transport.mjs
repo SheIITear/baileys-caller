@@ -136,6 +136,8 @@ const appendRelayPacketLog = (direction, connection, packet) => {
 };
 export class RelayRtcTransport {
     config;
+    /** Set by closeAll(): the transport is torn down and must not renegotiate. */
+    #destroyed = false;
     #relayInfoById = new Map();
     #connections = new Map();
     #totals = createEmptyStats();
@@ -199,7 +201,7 @@ export class RelayRtcTransport {
         this.#relayInfoById.clear();
         for (const [id, info] of nextInfoById) {
             this.#relayInfoById.set(id, info);
-            void this.#ensureConnection(info);
+            this.#ensureConnectionSafe(info);
         }
     };
     send = (packet, ip, port) => {
@@ -243,7 +245,7 @@ export class RelayRtcTransport {
             return packet.byteLength;
         }
         bufferPacket(connection, arrayBuffer);
-        void this.#ensureConnection(info);
+        this.#ensureConnectionSafe(info);
         return packet.byteLength;
     };
     getStats = () => {
@@ -254,7 +256,17 @@ export class RelayRtcTransport {
         }
         return { ...this.#totals, openConnections };
     };
+    /**
+     * Close every connection and forget the relay list, but stay usable: the
+     * next call's relay list opens fresh connections. For when a call ends.
+     */
+    closeConnections = () => {
+        for (const id of [...this.#connections.keys()])
+            this.#closeConnection(id);
+        this.#relayInfoById.clear();
+    };
     closeAll = async () => {
+        this.#destroyed = true;
         for (const id of [...this.#connections.keys()])
             this.#closeConnection(id);
     };
@@ -298,7 +310,18 @@ export class RelayRtcTransport {
         this.#connections.set(id, created);
         return created;
     };
+    /**
+     * Fire-and-forget entry point for connection setup. Connect failures are a
+     * normal part of relay churn (and of a call ending mid-negotiation), so they
+     * are swallowed here — an unhandled rejection would take the host process
+     * down on Node >= 15.
+     */
+    #ensureConnectionSafe = (info) => {
+        void this.#ensureConnection(info).catch(() => undefined);
+    };
     #ensureConnection = async (info) => {
+        if (this.#destroyed)
+            return;
         const connection = this.#getOrCreateConnection(info);
         if (connection.state === "open" || connection.state === "connecting") {
             return connection.connectPromise ?? Promise.resolve();
@@ -313,6 +336,8 @@ export class RelayRtcTransport {
         }
     };
     #connect = async (connection) => {
+        if (this.#destroyed)
+            return;
         const wrtcModule = await this.#loadWrtc();
         const { RTCPeerConnection } = wrtcModule;
         if (typeof RTCPeerConnection !== "function") {
@@ -363,12 +388,20 @@ export class RelayRtcTransport {
                 this.#closePeerObjects(connection);
             }
         }, CONNECTION_TIMEOUT_MS);
+        /** True once this pc was replaced or closed underneath us. */
+        const stale = () => this.#destroyed || connection.peerConnection !== pc || pc.signalingState === "closed";
         const offer = await pc.createOffer();
+        if (stale())
+            return;
         await pc.setLocalDescription(offer);
+        if (stale())
+            return;
         const remoteSdp = buildRemoteRelayAnswer(offer.sdp ?? "", {
             ...connection.info,
             port: getRtcConnectPort(connection.info),
         });
+        if (stale())
+            return;
         await pc.setRemoteDescription({ type: "answer", sdp: remoteSdp });
     };
     #restartIce = async (connection) => {

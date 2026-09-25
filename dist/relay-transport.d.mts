@@ -38,6 +38,11 @@ export declare class RelayRtcTransport {
     updateRelayList: (update: RelayListUpdatePayload) => void;
     send: (packet: Uint8Array | Buffer, ip: string, port: number) => number;
     getStats: () => RelayTransportStats;
+    /**
+     * Close every connection and forget the relay list, but stay usable: the
+     * next call's relay list opens fresh connections. For when a call ends.
+     */
+    closeConnections: () => void;
     closeAll: () => Promise<void>;
 }
 export {};

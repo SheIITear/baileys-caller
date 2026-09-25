@@ -18,12 +18,20 @@ import { WasmEngine } from "./wasm-engine.mjs";
 import { RelayRtcTransport, type RelayListUpdatePayload } from "./relay-transport.mjs";
 import { SignalingBridge } from "./signaling.mjs";
 import { AudioFeeder } from "./audio-feeder.mjs";
+import { StreamFeeder } from "./stream-feeder.mjs";
 import { CallState, type VoipSdkConfig } from "./types.mjs";
 
 export type { VoipSdkConfig, CallOptions, CallEvents, AudioConfig } from "./types.mjs";
 export { CallState } from "./types.mjs";
 
 const SHA256_LEN = 32;
+
+/**
+ * How long to wait for the stack to confirm a local hang-up before ending the
+ * call ourselves. Without this, a hang-up the stack never reports would leave
+ * `ended` unfired and `waitForEnd()` pending forever.
+ */
+const HANGUP_CONFIRM_MS = 2500;
 
 const loadBaileys = async (): Promise<any> => {
   try {
@@ -82,10 +90,15 @@ export class ActiveCall extends EventEmitter {
   #endResolver!: (reason: string) => void;
   readonly #endPromise: Promise<string>;
   #endTimer: NodeJS.Timeout | null = null;
+  #hangUpTimer: NodeJS.Timeout | null = null;
+  #hangUpRequested = false;
   #ended = false;
 
   /** @internal mirrors the source path for the audio feeder */
   _audioSource: string = "silence";
+
+  /** @internal set when `audioSource` is `"stream"` */
+  _stream: StreamFeeder | null = null;
 
   constructor(
     public readonly callId: string,
@@ -102,10 +115,14 @@ export class ActiveCall extends EventEmitter {
   get state(): CallState { return this.#state; }
 
   end = (): void => {
-    if (this.#ended) return;
-    this.#ended = true;
+    if (this.#ended || this.#hangUpRequested) return;
+    this.#hangUpRequested = true;
     if (this.#endTimer) { clearTimeout(this.#endTimer); this.#endTimer = null; }
     try { this.engine.endCall(0, true); } catch {}
+    // Normally the stack reports Idle/Ending right after and _forceEnd runs;
+    // this only covers the case where it never does.
+    this.#hangUpTimer = setTimeout(() => this._forceEnd("hangup"), HANGUP_CONFIRM_MS);
+    this.#hangUpTimer.unref?.();
   };
 
   mute = (muted: boolean): void => {
@@ -113,6 +130,24 @@ export class ActiveCall extends EventEmitter {
   };
 
   waitForEnd = (): Promise<string> => this.#endPromise;
+
+  /**
+   * Stream mode only (`audioSource: "stream"`): queue mono Float32 PCM at
+   * 16 kHz for the uplink. Audio pushed before the call connects is kept.
+   */
+  pushAudio = (pcm: Float32Array): void => {
+    if (!this._stream) throw new Error('pushAudio requires audioSource: "stream"');
+    this._stream.push(pcm);
+  };
+
+  /** Stream mode only: queue a trailing partial frame (end of an utterance). */
+  flushAudio = (): void => { this._stream?.flush(); };
+
+  /** Stream mode only: drop queued uplink audio, e.g. when the user barges in. */
+  clearAudio = (): void => { this._stream?.clear(); };
+
+  /** Stream mode only: chunks (20 ms each at 16 kHz) still waiting to be sent. */
+  get queuedAudioChunks(): number { return this._stream?.queuedChunks ?? 0; }
 
   /** @internal — called by VoipClient on WASM call-state change */
   _updateState = (state: number): void => {
@@ -132,6 +167,7 @@ export class ActiveCall extends EventEmitter {
     if (this.#ended) return;
     this.#ended = true;
     if (this.#endTimer) { clearTimeout(this.#endTimer); this.#endTimer = null; }
+    if (this.#hangUpTimer) { clearTimeout(this.#hangUpTimer); this.#hangUpTimer = null; }
     this.emit("ended", reason);
     this.#endResolver(reason);
   };
@@ -153,20 +189,27 @@ export class VoipClient {
   #captureSampleRate = 16000;
   #captureChannels = 1;
   #captureFramesPerChunk = 320;
-  #feeder: AudioFeeder | null = null;
+  #feeder: AudioFeeder | StreamFeeder | null = null;
+  #wsHandlers: Array<[string, (node: any) => void]> = [];
+  #ownsSocket = false;
 
-  constructor(config: VoipSdkConfig) {
+  constructor(config: VoipSdkConfig = {}) {
     this.#config = config;
   }
 
+  /** True once the VoIP stack is up (after connect() or attach()). */
+  get ready(): boolean { return this.#engine !== null; }
+
   /** Connect to WhatsApp and bring up the WASM VoIP stack. */
   connect = async (): Promise<void> => {
+    if (!this.#config.authDir) throw new Error("connect() requires authDir; use attach(sock) for an existing socket.");
+    this.#ownsSocket = true;
     this.#baileys = await loadBaileys();
     const { useMultiFileAuthState, default: makeWASocket, DisconnectReason } = this.#baileys;
     const makeSocket: (opts: any) => any =
       makeWASocket ?? this.#baileys.makeWASocket ?? this.#baileys;
 
-    const authDir = resolve(this.#config.authDir);
+    const authDir = resolve(this.#config.authDir as string);
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
     const silentLogger: any = {
@@ -239,6 +282,42 @@ export class VoipClient {
       connectSocket();
     });
 
+    await this.#bootstrap();
+  };
+
+  /**
+   * Bring up the VoIP stack on a Baileys socket the caller already owns and
+   * keeps alive (auth, reconnects, QR). The socket must be open. Never touches
+   * process-wide handlers. Call detach() before the socket is replaced.
+   */
+  attach = async (sock: any): Promise<void> => {
+    if (this.#engine) throw new Error("Already attached. Call detach() first.");
+    if (!sock?.ws || !sock?.authState?.creds?.me?.id) {
+      throw new Error("attach() needs an open, authenticated Baileys socket.");
+    }
+    this.#ownsSocket = false;
+    this.#sock = sock;
+    await this.#bootstrap();
+  };
+
+  /** Tear down the VoIP stack but leave an attached socket running. */
+  detach = (): void => {
+    this.#activeCall?._forceEnd("disconnect");
+    this.#activeCall = null;
+    this.#handleAudioCaptureStop();
+    for (const [event, handler] of this.#wsHandlers) {
+      try { this.#sock?.ws?.off?.(event, handler); } catch {}
+    }
+    this.#wsHandlers = [];
+    this.#relay?.closeAll();
+    this.#engine?.destroy();
+    this.#engine = null;
+    this.#relay = null;
+    this.#signaling = null;
+    if (!this.#ownsSocket) this.#sock = null;
+  };
+
+  #bootstrap = async (): Promise<void> => {
     this.#signaling = new SignalingBridge({ sock: this.#sock });
     await this.#signaling.init();
 
@@ -248,6 +327,8 @@ export class VoipClient {
     });
 
     this.#engine = new WasmEngine({
+      pthreadPoolSize: this.#config.pthreadPoolSize,
+      runtimePthreadPoolSize: this.#config.runtimePthreadPoolSize,
       callbacks: {
         onSignalingXmpp: (peerJid, callId, xmlPayload) =>
           this.#signaling!.sendSignaling(peerJid, callId, xmlPayload),
@@ -271,13 +352,17 @@ export class VoipClient {
     await this.#engine.waitForVoipStackReady();
     try { this.#engine.updateNetworkMedium(2, 0); } catch {}
 
-    this.#sock.ws.on("CB:call", (node: any) => {
-      this.#signaling!.processIncomingCall(node, this.#engine!, this.#activeCall?.callId ?? "");
-    });
-    this.#sock.ws.on("CB:receipt", (node: any) => {
-      if (!isCallReceiptNode(node)) return;
-      this.#signaling!.processIncomingReceipt(node, this.#engine!, this.#activeCall?.callId ?? "");
-    });
+    const onCall = (node: any) => {
+      if (!this.#signaling || !this.#engine) return;
+      this.#signaling.processIncomingCall(node, this.#engine, this.#activeCall?.callId ?? "");
+    };
+    const onReceipt = (node: any) => {
+      if (!isCallReceiptNode(node) || !this.#signaling || !this.#engine) return;
+      this.#signaling.processIncomingReceipt(node, this.#engine, this.#activeCall?.callId ?? "");
+    };
+    this.#sock.ws.on("CB:call", onCall);
+    this.#sock.ws.on("CB:receipt", onReceipt);
+    this.#wsHandlers = [["CB:call", onCall], ["CB:receipt", onReceipt]];
   };
 
   /** Place an outbound voice call. */
@@ -314,7 +399,14 @@ export class VoipClient {
 
     const call = new ActiveCall(callId, this.#engine, durationMs);
     call._audioSource = audioSource;
+    if (audioSource === "stream") call._stream = new StreamFeeder();
     this.#activeCall = call;
+    call.once("ended", () => {
+      if (this.#activeCall === call) this.#activeCall = null;
+      // Each relay connection is a native WebRTC peer with its own threads and
+      // buffers; left open they outlive the call until the next relay list.
+      this.#relay?.closeConnections();
+    });
 
     this.#engine.startCall({
       peerJid: peerLid,
@@ -332,14 +424,8 @@ export class VoipClient {
 
   /** Tear down the WhatsApp socket and release resources. */
   disconnect = (): void => {
-    this.#activeCall?._forceEnd("disconnect");
-    this.#activeCall = null;
-    this.#relay?.closeAll();
-    this.#engine?.destroy();
-    this.#sock?.end?.();
-    this.#engine = null;
-    this.#relay = null;
-    this.#signaling = null;
+    this.detach();
+    if (this.#ownsSocket) this.#sock?.end?.();
     this.#sock = null;
   };
 
@@ -377,6 +463,19 @@ export class VoipClient {
 
   #handleAudioCaptureStart = (): void => {
     if (!this.#engine || !this.#capturePtr) return;
+    const stream = this.#activeCall?._stream;
+    if (stream) {
+      stream.start(
+        this.#captureSampleRate,
+        this.#captureChannels,
+        this.#captureFramesPerChunk,
+        (chunk) => {
+          if (this.#engine && this.#capturePtr) this.#engine.sendAudioData(chunk, this.#capturePtr);
+        },
+      );
+      this.#feeder = stream;
+      return;
+    }
     const audioSource = this.#activeCall?._audioSource ?? "silence";
     this.#feeder = new AudioFeeder(
       this.#captureSampleRate,

@@ -1,4 +1,3 @@
-var _a;
 /**
  * WhatsApp VoIP WASM engine.
  *
@@ -17,7 +16,8 @@ import { fileURLToPath } from "node:url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const CALL_WASM_AB_PROPS_JSON = process.env.CALL_WASM_AB_PROPS_JSON ?? "";
-const PTHREAD_POOL_SIZE = 20;
+/** WhatsApp Web's own pool size; the default when `pthreadPoolSize` is not set. */
+const DEFAULT_PTHREAD_POOL_SIZE = 20;
 const VOIP_READY_TIMEOUT_MS = 15_000;
 const parseJsonObjectEnv = (raw) => {
     if (!raw)
@@ -66,9 +66,15 @@ class NodeWorkerMessagePort {
     name;
     workerID = 0;
     pthread_ptr = 0;
-    constructor(worker, name = "WAWebVoipWebWasmWorker") {
+    #onCallback;
+    /**
+     * `onCallback` routes the worker's callbacks to the engine that owns it. Without
+     * it they only reach the static listeners, which cannot tell engines apart.
+     */
+    constructor(worker, name = "WAWebVoipWebWasmWorker", onCallback) {
         this.#worker = worker;
         this.name = name;
+        this.#onCallback = onCallback;
         this.fullyConnected = new Promise((resolve) => {
             const loadedHandler = (msg) => {
                 if (msg && msg.cmd === "loaded") {
@@ -172,6 +178,7 @@ class NodeWorkerMessagePort {
                 if (data.eventDataJson !== undefined)
                     listenerData.eventDataJson = data.eventDataJson;
             }
+            this.#onCallback?.(callbackName, listenerData);
             WasmEngine.notifyGlobalCallbackListeners(callbackName, listenerData);
             return;
         }
@@ -191,19 +198,24 @@ class NodeWorkerMessagePort {
     };
 }
 export class WasmEngine {
+    /**
+     * Listeners outside any engine, kept for callers that register their own.
+     * The engine's callbacks are per instance (see #callbackListeners): a static
+     * registration captured the first engine forever, so after a detach/attach
+     * every event went to the destroyed engine and kept it alive.
+     */
     static #globalCallbackListeners = new Map();
-    static #globalCallbacksRegistered = false;
     static registerGlobalCallbackListener = (callbackName, handler) => {
         const key = `callback:${callbackName}`;
-        let set = _a.#globalCallbackListeners.get(key);
+        let set = WasmEngine.#globalCallbackListeners.get(key);
         if (!set) {
             set = new Set();
-            _a.#globalCallbackListeners.set(key, set);
+            WasmEngine.#globalCallbackListeners.set(key, set);
         }
         set.add(handler);
     };
     static notifyGlobalCallbackListeners = (callbackName, data) => {
-        const set = _a.#globalCallbackListeners.get(`callback:${callbackName}`);
+        const set = WasmEngine.#globalCallbackListeners.get(`callback:${callbackName}`);
         if (!set)
             return;
         for (const handler of set) {
@@ -218,8 +230,11 @@ export class WasmEngine {
     #initialized = false;
     #moduleRegistry = new Map();
     #vmContext = null;
+    #callbackListeners = new Map();
     #unusedWorkers = [];
     #runningWorkers = [];
+    /** Workers the VoIP code spawns itself; not part of the pthread pool. */
+    #dedicatedWorkers = new Set();
     #pthreads = {};
     #nextWorkerID = 1;
     #wasmModule = null;
@@ -315,8 +330,7 @@ export class WasmEngine {
         if (typeof wasmLoader !== "function") {
             throw new Error(`No compatible WASM loader found. Tried: ${loaderModuleNames.join(", ")}`);
         }
-        if (!_a.#globalCallbacksRegistered)
-            this.#registerGlobalCallbacks();
+        this.#registerWorkerCallbacks();
         await this.#initPThreadPool();
         const workersLoadingPromise = this.#loadWasmModuleToAllWorkers();
         const readyPromise = wasmLoader({
@@ -324,12 +338,35 @@ export class WasmEngine {
             wasmMemory: memory,
             locateFile: () => this.#config.wasmPath,
             onRuntimeInitialized: () => { },
+            ...(this.#config.runtimePthreadPoolSize !== undefined
+                ? { pthreadPoolSizeOverride: this.#config.runtimePthreadPoolSize }
+                : {}),
         });
         const [instance] = await Promise.all([readyPromise, workersLoadingPromise]);
         this.#instance = instance;
         this.#initialized = true;
     };
     isInitialized = () => this.#initialized;
+    /** Worker threads alive now: size `pthreadPoolSize` from the peak `running` on real calls. */
+    workerStats = () => ({
+        pool: this.#poolSize,
+        running: this.#runningWorkers.length,
+        unused: this.#unusedWorkers.length,
+        dedicated: this.#dedicatedWorkers.size,
+    });
+    get #poolSize() {
+        const size = this.#config.pthreadPoolSize;
+        return size !== undefined && Number.isInteger(size) && size >= 0 ? size : DEFAULT_PTHREAD_POOL_SIZE;
+    }
+    #dispatchWorkerCallback = (callbackName, data) => {
+        const handler = this.#callbackListeners.get(callbackName);
+        if (!handler)
+            return;
+        try {
+            handler(data);
+        }
+        catch { }
+    };
     destroy = () => {
         this.#stopAudioPlaybackLoop();
         if (this.#instance && typeof this.#instance.endCall === "function") {
@@ -344,6 +381,22 @@ export class WasmEngine {
             }
             catch { }
         }
+        for (const worker of this.#dedicatedWorkers) {
+            try {
+                void worker.terminate();
+            }
+            catch { }
+        }
+        this.#dedicatedWorkers.clear();
+        this.#callbackListeners.clear();
+        this.#releasePendingWaits();
+        // The process-wide copy would otherwise keep this engine alive until the next one replaces it.
+        const g = global;
+        if (this.#globalWasmCallbacks && g.WhatsAppVoipWasmCallbacks === this.#globalWasmCallbacks) {
+            delete g.WhatsAppVoipWasmCallbacks;
+            delete g.WhatsAppVoipWasmWorkerCompatibleCallbacks;
+        }
+        this.#globalWasmCallbacks = null;
         this.#runningWorkers = [];
         this.#unusedWorkers = [];
         this.#instance = null;
@@ -710,7 +763,7 @@ export class WasmEngine {
                     enableLogs: this.#config.enableLogs,
                 },
             });
-            const port = new NodeWorkerMessagePort(worker, "WAWebVoipWebWasmWorker");
+            const port = new NodeWorkerMessagePort(worker, "WAWebVoipWebWasmWorker", this.#dispatchWorkerCallback);
             worker.stdout?.on("data", () => { }); // suppress noisy worker stdout
             worker.stderr?.on("data", filterWorkerStderr);
             this.#unusedWorkers.push(port);
@@ -718,7 +771,7 @@ export class WasmEngine {
         catch { }
     };
     #initPThreadPool = async () => {
-        for (let i = 0; i < PTHREAD_POOL_SIZE; i += 1)
+        for (let i = 0; i < this.#poolSize; i += 1)
             this.#allocateUnusedWorker();
     };
     #loadWasmModuleToWorker = (worker) => new Promise((resolve) => {
@@ -726,7 +779,7 @@ export class WasmEngine {
             if (msg && msg.cmd === "loaded") {
                 worker.removeMessageListener("cmd", loadedHandler);
                 this.#workersLoadedCount += 1;
-                if (this.#workersLoadedCount >= PTHREAD_POOL_SIZE && this.#removeRunDependencyCallback) {
+                if (this.#workersLoadedCount >= this.#poolSize && this.#removeRunDependencyCallback) {
                     this.#removeRunDependencyCallback("loading-workers");
                 }
                 resolve();
@@ -746,9 +799,13 @@ export class WasmEngine {
         this.#workersLoadedCount = 0;
         await Promise.all(this.#unusedWorkers.map((w) => this.#loadWasmModuleToWorker(w)));
     };
-    #registerGlobalCallbacks = () => {
+    #registerWorkerCallbacks = () => {
         const callbacks = this.#config.callbacks ?? {};
-        _a.registerGlobalCallbackListener("loggingCallback", (data) => {
+        const on = (callbackName, handler) => {
+            this.#callbackListeners.set(callbackName, handler);
+        };
+        on("loggingCallback", (data) => {
+            this.#noteStackLog(data?.message);
             if (!this.#config.enableLogs)
                 return;
             const level = data?.level;
@@ -757,7 +814,7 @@ export class WasmEngine {
             callbacks.onLog?.(mapped, msg);
         });
         if (callbacks.onAudioCaptureInit) {
-            _a.registerGlobalCallbackListener("initCaptureDriverJS", (data) => {
+            on("initCaptureDriverJS", (data) => {
                 callbacks.onAudioCaptureInit({
                     sampleRate: data?.sample_rate ?? data?.sampleRate,
                     channels: data?.channels,
@@ -766,10 +823,10 @@ export class WasmEngine {
                 });
             });
         }
-        _a.registerGlobalCallbackListener("startCaptureJS", () => callbacks.onAudioCaptureStart?.());
-        _a.registerGlobalCallbackListener("stopCaptureJS", () => callbacks.onAudioCaptureStop?.());
+        on("startCaptureJS", () => callbacks.onAudioCaptureStart?.());
+        on("stopCaptureJS", () => callbacks.onAudioCaptureStop?.());
         if (callbacks.onAudioPlaybackInit) {
-            _a.registerGlobalCallbackListener("initPlaybackDriverJS", (data) => {
+            on("initPlaybackDriverJS", (data) => {
                 callbacks.onAudioPlaybackInit({
                     sampleRate: data?.sample_rate ?? data?.sampleRate,
                     channels: data?.channels,
@@ -778,16 +835,16 @@ export class WasmEngine {
                 });
             });
         }
-        _a.registerGlobalCallbackListener("startPlaybackJS", () => {
+        on("startPlaybackJS", () => {
             callbacks.onAudioPlaybackStart?.();
             this.#startAudioPlaybackLoop();
         });
-        _a.registerGlobalCallbackListener("stopPlaybackJS", () => {
+        on("stopPlaybackJS", () => {
             this.#stopAudioPlaybackLoop();
             callbacks.onAudioPlaybackStop?.();
         });
         if (callbacks.onSignalingXmpp) {
-            _a.registerGlobalCallbackListener("onSignalingXmpp", (data) => {
+            on("onSignalingXmpp", (data) => {
                 const peerJid = data.peerJid ?? data.args?.peerJid;
                 const callId = data.callId ?? data.args?.callId;
                 let xmlPayload = data.xmlPayload ?? data.args?.xmlPayload;
@@ -801,12 +858,12 @@ export class WasmEngine {
             });
         }
         if (callbacks.onCallEvent) {
-            _a.registerGlobalCallbackListener("onCallEvent", (data) => {
+            on("onCallEvent", (data) => {
                 callbacks.onCallEvent(data.eventType, data.eventDataJson);
             });
         }
         if (callbacks.sendDataToRelay) {
-            _a.registerGlobalCallbackListener("sendDataToRelay", (data) => {
+            on("sendDataToRelay", (data) => {
                 let relayData = data.data ?? data.args?.data;
                 const ip = data.ip ?? data.args?.ip;
                 const portNum = data.port ?? data.args?.port;
@@ -828,8 +885,16 @@ export class WasmEngine {
                 return relayData.byteLength;
             });
         }
-        _a.#globalCallbacksRegistered = true;
     };
+    /** Ports the VoIP code constructs itself, bound to this engine's callbacks. */
+    get #ownedPortClass() {
+        const dispatch = this.#dispatchWorkerCallback;
+        return class extends NodeWorkerMessagePort {
+            constructor(worker, name) {
+                super(worker, name, dispatch);
+            }
+        };
+    }
     #requireModule = (name) => {
         const preDefinedModules = {
             Promise,
@@ -856,14 +921,16 @@ export class WasmEngine {
                     });
                     worker.stdout?.on("data", () => { });
                     worker.stderr?.on("data", filterWorkerStderr);
+                    this.#dedicatedWorkers.add(worker);
+                    worker.once("exit", () => this.#dedicatedWorkers.delete(worker));
                     return worker;
                 },
             },
             WorkerClient: { init: () => { } },
             WorkerMessagePort: {
-                WorkerMessagePort: NodeWorkerMessagePort,
+                WorkerMessagePort: this.#ownedPortClass,
                 CastWorkerMessagePort: (w) => w,
-                WorkerSyncedMessagePort: NodeWorkerMessagePort,
+                WorkerSyncedMessagePort: this.#ownedPortClass,
             },
             bx: Object.assign((id) => String(id), { getURL: () => "" }),
             HasteSupportData: { handle: () => { } },
@@ -957,6 +1024,7 @@ export class WasmEngine {
             onCallEvent: (data) => callbacks.onCallEvent?.(data?.eventType, data?.eventDataJson),
             sendDataToRelay: (data) => callbacks.sendDataToRelay?.(data?.data, data?.ip, data?.port),
             loggingCallback: (data) => {
+                this.#noteStackLog(data?.message);
                 if (!this.#config.enableLogs)
                     return;
                 const level = data?.level;
@@ -1051,7 +1119,7 @@ export class WasmEngine {
             wrapNativeSuper: (Class) => Class,
         };
         const addRunDependency = (dep) => {
-            if (dep === "loading-workers" && this.#workersLoadedCount >= PTHREAD_POOL_SIZE) {
+            if (dep === "loading-workers" && this.#workersLoadedCount >= this.#poolSize) {
                 setImmediate(() => this.#removeRunDependencyCallback?.(dep));
             }
         };
@@ -1079,6 +1147,7 @@ export class WasmEngine {
         if (typeof global !== "undefined") {
             global.WhatsAppVoipWasmCallbacks = wasmCallbacks;
             global.WhatsAppVoipWasmWorkerCompatibleCallbacks = wasmCallbacks;
+            this.#globalWasmCallbacks = wasmCallbacks;
         }
         const context = vm.createContext({
             self: selfObj, globalThis: selfObj, global: selfObj, window: selfObj,
@@ -1172,6 +1241,49 @@ export class WasmEngine {
         context.window = context;
         return context;
     };
+    /**
+     * Main-thread waits on shared memory, woken by the pthread workers. Once
+     * destroy() terminates the workers nothing wakes them, and V8 keeps every
+     * pending waitAsync promise as a GC root, so each one held the whole runtime
+     * (module bytes, shared memory) of a destroyed engine forever. Wrapping them
+     * lets destroy() cut that link and wake the wait itself.
+     */
+    #globalWasmCallbacks = null;
+    /**
+     * WhatsApp's runtime never calls onVoipReady, so waitForVoipStackReady used
+     * to end only at its 15 s timeout. The stack is up once its call-event
+     * thread starts (~20 ms after initVoipStack), which it logs.
+     */
+    #noteStackLog = (message) => {
+        if (this.#voipReadyResolver && typeof message === "string" && message.includes("call_event_proc started")) {
+            this.#voipReadyResolver();
+        }
+    };
+    #pendingWaits = new Set();
+    #trackedWaitAsync = (typedArray, index, value, timeout) => {
+        const result = Atomics.waitAsync(typedArray, index, value, timeout);
+        if (!result.async)
+            return result;
+        const wait = { array: typedArray, index, settle: null };
+        const value$ = new Promise((resolve) => { wait.settle = resolve; });
+        this.#pendingWaits.add(wait);
+        // The native promise only sees `wait`; dropping `settle` frees the runtime.
+        result.value.then((v) => {
+            this.#pendingWaits.delete(wait);
+            wait.settle?.(v);
+        });
+        return { async: true, value: value$ };
+    };
+    #releasePendingWaits = () => {
+        for (const wait of this.#pendingWaits) {
+            wait.settle = null;
+            try {
+                Atomics.notify(wait.array, wait.index);
+            }
+            catch { }
+        }
+        this.#pendingWaits.clear();
+    };
     #createAtomicsWrapper = (_memory) => {
         const atomicsWrapper = {
             add: Atomics.add.bind(Atomics),
@@ -1195,7 +1307,7 @@ export class WasmEngine {
                 }
             },
             waitAsync: Atomics.waitAsync
-                ? Atomics.waitAsync.bind(Atomics)
+                ? this.#trackedWaitAsync
                 : () => ({ async: true, value: Promise.resolve("ok") }),
             wait: (typedArray, index, value, timeout) => {
                 const currentValue = Atomics.load(typedArray, index);
@@ -1210,5 +1322,4 @@ export class WasmEngine {
         return atomicsWrapper;
     };
 }
-_a = WasmEngine;
 export default WasmEngine;

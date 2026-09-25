@@ -29,6 +29,20 @@ export type WasmEngineConfig = {
     loaderModuleName?: string;
     callbacks?: WasmEngineCallbacks;
     enableLogs?: boolean;
+    /**
+     * Workers this engine pre-loads for the `__NODE_PTHREAD` hooks. WhatsApp's
+     * runtime starts its threads through `createDedicatedWebWorker` instead
+     * (see `runtimePthreadPoolSize`), so these only cost memory: each is a V8
+     * isolate holding the VoIP module (~17 MB). Defaults to 20; 0 is valid.
+     */
+    pthreadPoolSize?: number;
+    /**
+     * Workers WhatsApp's runtime starts up front for its pthreads (its
+     * `pthreadPoolSizeOverride`, default 20). The runtime starts more on demand
+     * when a thread is needed beyond these, so a smaller pool trades memory for
+     * a slower first use. `workerStats().dedicated` shows how many exist.
+     */
+    runtimePthreadPoolSize?: number;
     options?: {
         heartbeatInterval?: number;
         lobbyTimeout?: number;
@@ -44,6 +58,13 @@ export declare class WasmEngine {
     constructor(config?: WasmEngineConfig);
     initialize: () => Promise<void>;
     isInitialized: () => boolean;
+    /** Worker threads alive now: size `pthreadPoolSize` from the peak `running` on real calls. */
+    workerStats: () => {
+        pool: number;
+        running: number;
+        unused: number;
+        dedicated: number;
+    };
     destroy: () => void;
     initVoipStack: (selfJid: string, meUserJid: string, selfLid: string) => void;
     waitForVoipStackReady: () => Promise<void>;
