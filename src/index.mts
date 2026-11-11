@@ -103,9 +103,8 @@ export class ActiveCall extends EventEmitter {
 
   end = (): void => {
     if (this.#ended) return;
-    this.#ended = true;
-    if (this.#endTimer) { clearTimeout(this.#endTimer); this.#endTimer = null; }
     try { this.engine.endCall(0, true); } catch {}
+    this._forceEnd("hangup"); // resolves waitForEnd(); previously it hung forever
   };
 
   mute = (muted: boolean): void => {
@@ -180,7 +179,10 @@ export class VoipClient {
       fatal: () => {},
     };
 
+    // WA rejects stale built-in versions with 405, so always ask for the current one.
+    const { version } = await this.#baileys.fetchLatestWaWebVersion({});
     const createSocket = () => makeSocket({
+      version,
       auth: state,
       emitOwnEvents: true,
       logger: silentLogger,

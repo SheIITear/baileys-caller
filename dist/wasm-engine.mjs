@@ -599,8 +599,9 @@ export class WasmEngine {
                     return;
                 const audioData = new Float32Array(heapF32.buffer, heapF32.byteOffset + index * 4, numFloats);
                 const hasNonZero = audioData.some((s) => Math.abs(s) > 0.0001);
+                // slice(): audioData is a view into the reused WASM heap buffer; consumers must get a copy
                 if (hasNonZero)
-                    this.#config.callbacks?.onAudioPlaybackData?.(audioData);
+                    this.#config.callbacks?.onAudioPlaybackData?.(audioData.slice());
             }
             catch { }
         }, 16);
