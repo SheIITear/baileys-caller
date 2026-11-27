@@ -359,6 +359,16 @@ export class SignalingBridge {
       usableNode = await this.#maybeDecryptEnc(voipChild, senderDeviceJid);
     }
 
+    // A sender on its primary device (device 0, i.e. a phone) arrives as an AD_JID with device 0, which Baileys
+    // decodes as a bare "user@lid" (jidEncode omits device 0). Re-encoding that bare JID writes a JID_PAIR, and
+    // the engine then reads call-creator as user:0@s.whatsapp.net, sees it differ from the peer (user:0@lid) and
+    // ignores the stanza ("mismatched peer id and creator id"): incoming offers from phones never ring. Desktop
+    // senders keep a non-zero device (user:NN@lid) and are not affected. Restore device 0 before re-encoding.
+    const callCreator = String(usableNode.attrs?.["call-creator"] ?? "");
+    if (/^[0-9]+@lid$/.test(callCreator)) {
+      usableNode.attrs["call-creator"] = callCreator.replace("@lid", ":0@lid");
+    }
+
     const b64 = Buffer.from(encodeBinaryNode(usableNode)).toString("base64");
 
     const storedPeerJid = callIdForRouting ? this.#incomingCallPeerById.get(callIdForRouting) : undefined;
